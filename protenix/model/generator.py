@@ -15,8 +15,73 @@
 from typing import Any, Callable, Optional
 
 import torch
+import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
 
 from protenix.model.utils import centre_random_augmentation
+import numpy as np
+import copy
+from torch.nn.functional import one_hot
+
+
+
+class TokenNoiser:
+    def __init__(
+        self, 
+        noise_token_id=20,
+        timesteps=200, 
+        discrete_schedule="linear",
+        noise_type="discrete",
+        continuous_factor=0.25,
+        continuous_threshold=3.0
+    ):
+        self.timesteps = timesteps
+        self.noise_token_id = noise_token_id
+        if discrete_schedule == "linear":
+            self.mask_rates = np.linspace(
+                0, 1, timesteps, dtype=np.float64
+            )
+        elif discrete_schedule == "cosine":
+            self.mask_rates = 1 - (np.cos(
+                np.pi * np.linspace(0, 1, timesteps, dtype=np.float64)
+            ) + 1.0) / 2
+        self.noise_type=noise_type
+        self.continuous_factor = continuous_factor
+        self.continuous_threshold = continuous_threshold
+    
+    def discrete_corrupt(self, seq, times, corrupt_mask=None):
+        mask_nums = torch.rand_like(seq, dtype=torch.float32)
+        mask = torch.zeros_like(mask_nums, dtype=torch.bool)
+        for i, t in enumerate(times):
+            mask[i] = mask_nums[i] < self.mask_rates[t]
+        
+        if corrupt_mask is not None:
+            mask = (mask * corrupt_mask).bool()
+
+        res = copy.deepcopy(seq)
+        for i, t in enumerate(times):
+            corrupt_ids = self.noise_token_id * torch.ones_like(seq[i])
+            res[i] = torch.where(mask[i], corrupt_ids, res[i])
+
+        return res, mask
+    
+    def continuous_corrupt(self, seq, sigma, corrupt_mask=None):
+        if len(seq.shape) == 2:
+            seqs = one_hot(seq, num_classes=32) # same to restype feature dimension
+        else:
+            seqs = seq
+        seq_noise = torch.randn_like(seqs.float())
+        if corrupt_mask is not None:
+            seq_noise = seq_noise * corrupt_mask.unsqueeze(-1)
+        res = seqs + self.continuous_factor * sigma * seq_noise
+        res = torch.clamp(res, min=-self.continuous_threshold, max=self.continuous_threshold)
+        return res
+
+    def corrupt(self, seq, noise, corrupt_mask=None):
+        if self.noise_type == "discrete":
+            return self.discrete_corrupt(seq, noise, corrupt_mask)
+        else:
+            return self.continuous_corrupt(seq, noise, corrupt_mask)
 
 
 class TrainingNoiseSampler:
@@ -139,6 +204,9 @@ def sample_diffusion(
     inplace_safe: bool = False,
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
+    token_noiser: Optional["TokenNoiser"] = None,
+    use_sequence: bool = False,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -172,18 +240,38 @@ def sample_diffusion(
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
+    N_step = len(noise_schedule) - 1
+
+    seq_denoised_final = None
+    if use_sequence and token_noiser is not None:
+        token_gt = input_feature_dict.get("token_gt")
+        cdr_mask = input_feature_dict.get("cdr_mask")
+        if token_gt is not None:
+            token_gt = token_gt.unsqueeze(0).expand(N_sample, -1)
+            input_feature_dict["token_gt"] = token_gt
+        if cdr_mask is not None:
+            cdr_mask = cdr_mask.unsqueeze(0).expand(N_sample, -1)
+            input_feature_dict["cdr_mask"] = cdr_mask
+        if "attn_mask" in input_feature_dict:
+            input_feature_dict["attn_mask"] = input_feature_dict["attn_mask"].unsqueeze(0).expand(N_sample, -1)
+
+        if token_noiser.noise_type == "discrete":
+            init_t = torch.tensor([N_step - 1] * N_sample, device=device)
+            seq_noisy, _ = token_noiser.corrupt(token_gt, init_t, cdr_mask)
+        else:
+            init_sigma = noise_schedule[0]
+            seq_noisy = token_noiser.corrupt(token_gt, init_sigma, cdr_mask)
+        input_feature_dict["token_noisy"] = seq_noisy
 
     def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
-        # init noise
-        # [..., N_sample, N_atom, 3]
+        seq_denoised_final = None
         x_l = noise_schedule[0] * torch.randn(
             size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype
-        )  # NOTE: set seed in distributed training
+        )
 
-        for _, (c_tau_last, c_tau) in enumerate(
+        for step_idx, (c_tau_last, c_tau) in enumerate(
             zip(noise_schedule[:-1], noise_schedule[1:])
         ):
-            # [..., N_sample, N_atom, 3]
             x_l = (
                 centre_random_augmentation(x_input_coords=x_l, N_sample=1)
                 .squeeze(dim=-3)
@@ -208,7 +296,7 @@ def sample_diffusion(
                 .to(dtype)
             )
 
-            x_denoised = denoise_net(
+            x_denoised, s_denoised = denoise_net(
                 x_noisy=x_noisy,
                 t_hat_noise_level=t_hat,
                 input_feature_dict=input_feature_dict,
@@ -223,18 +311,43 @@ def sample_diffusion(
                 enable_efficient_fusion=enable_efficient_fusion,
             )
 
-            delta = (x_noisy - x_denoised) / t_hat[
-                ..., None, None
-            ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe  is a typo.
+            if use_sequence and token_noiser is not None and s_denoised is not None:
+                t = N_step - 1 - step_idx
+                if t > 0:
+                    token_gt = input_feature_dict.get("token_gt")
+                    cdr_mask = input_feature_dict.get("cdr_mask")
+                    seq_mask = input_feature_dict.get("seq_mask", cdr_mask)
+                    
+                    if token_noiser.noise_type == "discrete":
+                        seq_pred = Categorical(logits=s_denoised * temperature).sample()
+                        next_t = torch.tensor([t - 1] * chunk_n_sample, device=device)
+                        seq_noisy, _ = token_noiser.corrupt(seq_pred, next_t, seq_mask)
+                        if token_gt is not None and cdr_mask is not None:
+                            noise_gt, _ = token_noiser.corrupt(token_gt, next_t, cdr_mask)
+                            seq_noisy = torch.where(seq_mask.bool(), seq_noisy, noise_gt)
+                    else:
+                        seq_prob = F.softmax(s_denoised * temperature, dim=-1)
+                        next_sigma = c_tau * (1 + gamma0 if c_tau > gamma_min else 1)
+                        seq_noisy = token_noiser.corrupt(seq_prob, next_sigma, seq_mask)
+                        if token_gt is not None and cdr_mask is not None:
+                            noise_gt = token_noiser.corrupt(token_gt, next_sigma, cdr_mask)
+                            seq_noisy = torch.where(seq_mask.unsqueeze(-1).bool(), seq_noisy, noise_gt)
+                    
+                    input_feature_dict["token_noisy"] = seq_noisy
+                else:
+                    seq_denoised_final = s_denoised
+
+            delta = (x_noisy - x_denoised) / t_hat[..., None, None]
             dt = c_tau - t_hat
             x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
 
-        return x_l
+        return x_l, seq_denoised_final
 
     if diffusion_chunk_size is None:
-        x_l = _chunk_sample_diffusion(N_sample, inplace_safe=inplace_safe)
+        x_l, seq_denoised_final = _chunk_sample_diffusion(N_sample, inplace_safe=inplace_safe)
     else:
         x_l = []
+        seq_chunks = []
         no_chunks = N_sample // diffusion_chunk_size + (
             N_sample % diffusion_chunk_size != 0
         )
@@ -244,16 +357,24 @@ def sample_diffusion(
                 if i < no_chunks - 1
                 else N_sample - i * diffusion_chunk_size
             )
-            chunk_x_l = _chunk_sample_diffusion(
+            chunk_x_l, chunk_seq = _chunk_sample_diffusion(
                 chunk_n_sample, inplace_safe=inplace_safe
             )
             x_l.append(chunk_x_l)
+            if chunk_seq is not None:
+                seq_chunks.append(chunk_seq)
         x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
+        if len(seq_chunks) > 0:
+            seq_denoised_final = torch.cat(seq_chunks, dim=-3)
+    
+    if use_sequence:
+        return x_l, seq_denoised_final
     return x_l
 
 
 def sample_diffusion_training(
     noise_sampler: TrainingNoiseSampler,
+    token_noiser: Optional[TokenNoiser],
     denoise_net: Callable,
     label_dict: dict[str, Any],
     input_feature_dict: dict[str, Any],
@@ -303,15 +424,37 @@ def sample_diffusion_training(
         dtype
     )  # [..., N_sample, N_atom, 3]
 
+    input_feature_dict["token_gt"] = input_feature_dict["token_gt"].unsqueeze(0).expand(N_sample, -1)
+    input_feature_dict["cdr_mask"] = input_feature_dict["cdr_mask"].unsqueeze(0).expand(N_sample, -1)
+    if "attn_mask" in input_feature_dict:
+        input_feature_dict["attn_mask"] = input_feature_dict["attn_mask"].unsqueeze(0).expand(N_sample, -1)
+    
+    if token_noiser is not None:
+        if token_noiser.noise_type == "discrete":
+            times = torch.randint(token_noiser.timesteps, size=(*batch_size_shape, N_sample), device=device)
+            sigma = input_feature_dict["noise_schedule"]
+            gamma = torch.where(sigma > input_feature_dict["gamma_min"], input_feature_dict["gamma0"], 0.0)
+            sigma = sigma[:-1] * (1 +  gamma[1:])
+            sigma = sigma[token_noiser.timesteps - 1 - times]
+            input_feature_dict["token_noisy"], input_feature_dict["token_mask"] = \
+            token_noiser.corrupt(input_feature_dict["token_gt"], times, input_feature_dict["cdr_mask"])
+        else:
+            # Add independent noise to each structure
+            # sigma: independent noise-level [..., N_sample]
+            sigma = noise_sampler(size=(*batch_size_shape, N_sample), device=device).to(dtype)
+            # noise: [..., N_sample, N_atom, 3]
+            input_feature_dict["token_noisy"] = \
+            token_noiser.corrupt(input_feature_dict["token_gt"], sigma, input_feature_dict["cdr_mask"])
+
     # Add independent noise to each structure
     # sigma: independent noise-level [..., N_sample]
-    sigma = noise_sampler(size=(*batch_size_shape, N_sample), device=device).to(dtype)
+    # sigma = noise_sampler(size=(*batch_size_shape, N_sample), device=device).to(dtype)
     # noise: [..., N_sample, N_atom, 3]
     noise = torch.randn_like(x_gt_augment, dtype=dtype) * sigma[..., None, None]
 
     # Get denoising outputs [..., N_sample, N_atom, 3]
     if diffusion_chunk_size is None:
-        x_denoised = denoise_net(
+        x_denoised, s_denoised = denoise_net(
             x_noisy=x_gt_augment + noise,
             t_hat_noise_level=sigma,
             input_feature_dict=input_feature_dict,
@@ -325,7 +468,7 @@ def sample_diffusion_training(
             enable_efficient_fusion=enable_efficient_fusion,
         )
     else:
-        x_denoised = []
+        x_denoised, s_denoised = [], []
         no_chunks = N_sample // diffusion_chunk_size + (
             N_sample % diffusion_chunk_size != 0
         )
@@ -336,7 +479,7 @@ def sample_diffusion_training(
             t_hat_noise_level_i = sigma[
                 ..., i * diffusion_chunk_size : (i + 1) * diffusion_chunk_size
             ]
-            x_denoised_i = denoise_net(
+            x_denoised_i, s_denoised_i = denoise_net(
                 x_noisy=x_noisy_i,
                 t_hat_noise_level=t_hat_noise_level_i,
                 input_feature_dict=input_feature_dict,
@@ -350,6 +493,12 @@ def sample_diffusion_training(
                 enable_efficient_fusion=enable_efficient_fusion,
             )
             x_denoised.append(x_denoised_i)
+            if s_denoised_i is not None:
+                s_denoised.append(s_denoised_i)
         x_denoised = torch.cat(x_denoised, dim=-3)
+        if len(s_denoised) > 0:
+            s_denoised = torch.cat(s_denoised, dim=-3)
+        else:
+            s_denoised = None
 
-    return x_gt_augment, x_denoised, sigma
+    return x_gt_augment, x_denoised, sigma, s_denoised

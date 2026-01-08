@@ -24,6 +24,7 @@ python3 ./runner/train.py \
 --dtype bf16 \
 --project protenix \
 --use_wandb false \
+--use_sequence true \
 --diffusion_batch_size 48 \
 --eval_interval 400 \
 --log_interval 50 \

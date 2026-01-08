@@ -410,6 +410,135 @@ def get_continues_crop_index(
     return selected_token_indices
 
 
+def get_antibody_crop_index(
+    tokens: torch.Tensor,
+    chain_id: torch.Tensor,
+    token_coords: torch.Tensor,
+    antibody_chain_ids: list[int],
+    crop_size: int,
+    add_antigen: bool = True,
+    min_neighborhood: int = 0,
+    max_neighborhood: int = 40,
+    cdr_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Crop with antibody chains preserved completely, then add nearby antigen residues.
+    Similar to MFDesign AntibodyCropper logic.
+    
+    Args:
+        tokens: [N_token], token indices
+        chain_id: [N_token], chain ID for each token
+        token_coords: [N_token, 3], center coordinates for each token
+        antibody_chain_ids: list of chain IDs for antibody (H and L chains)
+        crop_size: maximum number of tokens to crop
+        add_antigen: whether to add antigen tokens around antibody
+        min_neighborhood: minimum neighborhood size for antigen cropping
+        max_neighborhood: maximum neighborhood size for antigen cropping
+        cdr_mask: [N_token], boolean mask for CDR/epitope regions
+    
+    Returns:
+        selected_token_indices: torch.Tensor of selected token indices
+    """
+    device = tokens.device
+    n_tokens = len(tokens)
+    
+    # Step 1: Include all antibody chain tokens
+    cropped = set()
+    ab_mask = torch.zeros(n_tokens, dtype=torch.bool, device=device)
+    for ab_chain_id in antibody_chain_ids:
+        chain_mask = chain_id == ab_chain_id
+        ab_mask |= chain_mask
+        ab_indices = tokens[chain_mask].tolist()
+        cropped.update(ab_indices)
+    
+    if len(cropped) >= crop_size:
+        selected = sorted(list(cropped))[:crop_size]
+        return torch.tensor(selected, device=device)
+    
+    if not add_antigen:
+        return torch.tensor(sorted(list(cropped)), device=device)
+    
+    if cdr_mask is not None:
+        cdr_ab_mask = ab_mask & cdr_mask
+        if cdr_ab_mask.sum() > 0:
+            # Pick a random CDR token as query
+            cdr_indices = torch.where(cdr_ab_mask)[0]
+            query_idx = cdr_indices[torch.randint(len(cdr_indices), (1,)).item()]
+            query_coord = token_coords[query_idx:query_idx+1]
+        else:
+            # No CDR tokens, use random antibody token
+            ab_indices_tensor = torch.where(ab_mask)[0]
+            query_idx = ab_indices_tensor[torch.randint(len(ab_indices_tensor), (1,)).item()]
+            query_coord = token_coords[query_idx:query_idx+1]
+    else:
+        # No CDR mask, use random antibody token
+        ab_indices_tensor = torch.where(ab_mask)[0]
+        query_idx = ab_indices_tensor[torch.randint(len(ab_indices_tensor), (1,)).item()]
+        query_coord = token_coords[query_idx:query_idx+1]
+    
+    # Get antigen tokens (non-antibody)
+    ag_mask = ~ab_mask
+    ag_indices = tokens[ag_mask]
+    ag_coords = token_coords[ag_mask]
+    ag_chain_ids = chain_id[ag_mask]
+    
+    if len(ag_indices) == 0:
+        return torch.tensor(sorted(list(cropped)), device=device)
+    
+    # Random neighborhood size (like MFDesign)
+    neighborhood_sizes = list(range(min_neighborhood, max_neighborhood + 1, 2))
+    if len(neighborhood_sizes) == 0:
+        neighborhood_sizes = [20]
+    neighborhood_size = neighborhood_sizes[torch.randint(len(neighborhood_sizes), (1,)).item()]
+    
+    dists = torch.cdist(ag_coords.float(), query_coord.float()).squeeze(-1)  # [N_ag]
+    sorted_indices = torch.argsort(dists)
+    
+    # Add antigen tokens in order of proximity to antibody query point
+    for idx in sorted_indices:
+        if len(cropped) >= crop_size:
+            break
+        
+        ag_token_idx = ag_indices[idx].item()
+        ag_chain = ag_chain_ids[idx].item()
+        
+        chain_mask = chain_id == ag_chain
+        chain_tokens = tokens[chain_mask]
+        
+        if len(chain_tokens) <= neighborhood_size:
+            new_tokens = set(chain_tokens.tolist())
+        else:
+            # Find token position in chain
+            token_pos = (chain_tokens == ag_token_idx).nonzero(as_tuple=True)[0]
+            if len(token_pos) == 0:
+                continue
+            token_pos = token_pos[0].item()
+            
+            # Get neighborhood around this token
+            start_pos = max(0, token_pos - neighborhood_size // 2)
+            end_pos = min(len(chain_tokens), token_pos + neighborhood_size // 2 + 1)
+            
+            # Expand to reach neighborhood_size if possible
+            while (end_pos - start_pos) < neighborhood_size and (start_pos > 0 or end_pos < len(chain_tokens)):
+                if start_pos > 0:
+                    start_pos -= 1
+                if end_pos < len(chain_tokens) and (end_pos - start_pos) < neighborhood_size:
+                    end_pos += 1
+            
+            new_tokens = set(chain_tokens[start_pos:end_pos].tolist())
+        
+        new_tokens = new_tokens - cropped
+        
+        # Check if adding these tokens exceeds crop_size
+        if len(cropped) + len(new_tokens) > crop_size:
+            break
+        
+        cropped.update(new_tokens)
+    
+    selected_token_indices = torch.tensor(sorted(list(cropped)), device=device)
+    return selected_token_indices
+
+
 class CropData(object):
     """
     Crop the data based on the given crop size and reference chain indices (asym_id).
@@ -426,6 +555,11 @@ class CropData(object):
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
+        antibody_chain_ids: list[int] = None,
+        add_antigen: bool = True,
+        min_neighborhood: int = 0,
+        max_neighborhood: int = 40,
+        cdr_mask: np.ndarray = None,
     ) -> None:
         """
         Args:
@@ -443,11 +577,21 @@ class CropData(object):
         self.token_array = token_array
         self.atom_array = atom_array
         self.method_weights = method_weights
-        self.cand_crop_methods = [
-            "ContiguousCropping",
-            "SpatialCropping",
-            "SpatialInterfaceCropping",
-        ]
+        self.antibody_chain_ids = antibody_chain_ids
+        self.add_antigen = add_antigen
+        self.min_neighborhood = min_neighborhood
+        self.max_neighborhood = max_neighborhood
+        self.cdr_mask = cdr_mask
+        
+        if antibody_chain_ids is not None and len(antibody_chain_ids) > 0:
+            self.cand_crop_methods = ["AntibodyCropping"]
+            self.method_weights = [1.0]
+        else:
+            self.cand_crop_methods = [
+                "ContiguousCropping",
+                "SpatialCropping",
+                "SpatialInterfaceCropping",
+            ]
         self.contiguous_crop_complete_lig = contiguous_crop_complete_lig
         self.spatial_crop_complete_lig = spatial_crop_complete_lig
         self.drop_last = drop_last
@@ -670,6 +814,27 @@ class CropData(object):
             )
             reference_token_index = -1
 
+        elif crop_method == "AntibodyCropping":
+            centre_atom_indices = self.token_array.get_annotation("centre_atom_index")
+            token_coords = torch.tensor(self.atom_array.coord[centre_atom_indices])
+            
+            cdr_mask_tensor = None
+            if self.cdr_mask is not None:
+                cdr_mask_tensor = torch.tensor(self.cdr_mask)
+            
+            selected_token_indices = get_antibody_crop_index(
+                tokens=tokens,
+                chain_id=chain_id,
+                token_coords=token_coords,
+                antibody_chain_ids=self.antibody_chain_ids,
+                crop_size=self.crop_size,
+                add_antigen=self.add_antigen,
+                min_neighborhood=self.min_neighborhood,
+                max_neighborhood=self.max_neighborhood,
+                cdr_mask=cdr_mask_tensor,
+            )
+            reference_token_index = -1
+
         else:
             interface_crop = (
                 True if crop_method == "SpatialInterfaceCropping" else False
@@ -692,6 +857,9 @@ class CropData(object):
                 crop_complete_ligand_unstdRes=self.spatial_crop_complete_lig,
                 interface_crop=interface_crop,
             )
+        
+        if reference_token_index == -1:
+            return (selected_token_indices, -1)
         return (
             selected_token_indices,
             token_indices_in_ref[reference_token_index].item(),

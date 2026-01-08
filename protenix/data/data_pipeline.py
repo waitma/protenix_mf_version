@@ -33,6 +33,161 @@ from protenix.utils.file_io import load_gzip_pickle
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
+def get_cdr_indices_from_sequence(
+    sequence: str,
+    scheme: str = "imgt",
+) -> set:
+    """
+    Get CDR indices from antibody sequence using ANARCI/abnumber.
+    
+    Args:
+        sequence: Amino acid sequence (1-letter code)
+        scheme: Numbering scheme ('imgt', 'chothia', 'kabat')
+    
+    Returns:
+        Set of CDR indices (0-based positions in sequence)
+    """
+    try:
+        from abnumber import Chain as AbChain
+        use_anarci = False
+    except ImportError:
+        try:
+            from anarci import run_anarci
+            use_anarci = True
+        except ImportError:
+            raise ImportError("Please install abnumber or anarci: pip install abnumber")
+    
+    cdr_indices = set()
+    
+    if not use_anarci:
+        try:
+            ab_chain = AbChain(sequence, scheme=scheme)
+            fr1_len = len(ab_chain.fr1_seq)
+            cdr1_len = len(ab_chain.cdr1_seq)
+            fr2_len = len(ab_chain.fr2_seq)
+            cdr2_len = len(ab_chain.cdr2_seq)
+            fr3_len = len(ab_chain.fr3_seq)
+            cdr3_len = len(ab_chain.cdr3_seq)
+            
+            # CDR1
+            cdr1_start = fr1_len
+            cdr_indices.update(range(cdr1_start, cdr1_start + cdr1_len))
+            # CDR2
+            cdr2_start = fr1_len + cdr1_len + fr2_len
+            cdr_indices.update(range(cdr2_start, cdr2_start + cdr2_len))
+            # CDR3
+            cdr3_start = fr1_len + cdr1_len + fr2_len + cdr2_len + fr3_len
+            cdr_indices.update(range(cdr3_start, cdr3_start + cdr3_len))
+        except Exception:
+            pass
+    else:
+        try:
+            results = run_anarci([('seq', sequence)], scheme=scheme, allowed_species=['human', 'mouse'])
+            if results and results[0] and results[0][0]:
+                numbering = results[0][0][0]
+                for pos_idx, (pos, aa) in enumerate(numbering):
+                    pos_num = pos[0]
+                    if scheme == 'imgt':
+                        if 27 <= pos_num <= 38:  # CDR1
+                            cdr_indices.add(pos_idx)
+                        elif 56 <= pos_num <= 65:  # CDR2
+                            cdr_indices.add(pos_idx)
+                        elif 105 <= pos_num <= 117:  # CDR3
+                            cdr_indices.add(pos_idx)
+        except Exception:
+            pass
+    
+    return cdr_indices
+
+
+def generate_cdr_mask(
+    token_array: TokenArray,
+    atom_array: AtomArray,
+    cdr_chain_ids: list[str] = None,
+    sequences: dict[str, str] = None,
+    scheme: str = "imgt",
+) -> np.ndarray:
+    """
+    Generate CDR mask for tokens using ANARCI antibody numbering.
+    
+    Args:
+        token_array: TokenArray object
+        atom_array: AtomArray object
+        cdr_chain_ids: List of chain IDs for antibody chains to identify CDRs.
+                      If None, returns all False mask.
+        sequences: Dict mapping label_entity_id to canonical_sequence (from bioassembly_dict).
+                  If provided, uses these sequences instead of extracting from tokens.
+        scheme: Numbering scheme for ANARCI ('imgt', 'chothia', 'kabat', etc.)
+    
+    Returns:
+        np.ndarray: Boolean mask of shape [N_token], True for CDR positions.
+    """
+    from protenix.data.constants import PRO_STD_RESIDUES
+    
+    n_tokens = len(token_array)
+    cdr_mask = np.zeros(n_tokens, dtype=bool)
+    
+    if cdr_chain_ids is None or len(cdr_chain_ids) == 0:
+        return cdr_mask
+    
+    # Get chain_id and label_entity_id for each token
+    centre_atom_indices = token_array.get_annotation("centre_atom_index")
+    token_chain_ids = atom_array[centre_atom_indices].chain_id
+    
+    # Token value to 1-letter mapping (fallback if sequences not provided)
+    id_to_3letter = {v: k for k, v in PRO_STD_RESIDUES.items()}
+    aa_3to1 = {
+        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+        'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+        'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+        'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
+        'UNK': 'X'
+    }
+    
+    for chain_id in cdr_chain_ids:
+        chain_token_mask = token_chain_ids == chain_id
+        chain_token_indices = np.where(chain_token_mask)[0]
+        
+        if len(chain_token_indices) == 0:
+            continue
+        
+        # Get sequence for this chain
+        sequence = None
+        
+        # Try to get sequence from bioassembly_dict sequences
+        if sequences is not None:
+            # Get label_entity_id for this chain
+            chain_atoms = atom_array[atom_array.chain_id == chain_id]
+            if len(chain_atoms) > 0 and hasattr(chain_atoms, 'label_entity_id'):
+                entity_id = str(chain_atoms.label_entity_id[0])
+                sequence = sequences.get(entity_id, None)
+        
+        # Fallback: extract sequence from token values
+        if sequence is None:
+            sequence_chars = []
+            for idx in chain_token_indices:
+                token = token_array[idx]
+                token_value = token.value
+                three_letter = id_to_3letter.get(token_value, 'UNK')
+                one_letter = aa_3to1.get(three_letter, 'X')
+                sequence_chars.append(one_letter)
+            sequence = ''.join(sequence_chars)
+        
+        if len(sequence) == 0 or all(c == 'X' for c in sequence):
+            continue
+        
+        # Get CDR indices from sequence
+        cdr_indices_in_chain = get_cdr_indices_from_sequence(sequence, scheme)
+        
+        # Map chain indices to global token indices
+        for local_idx in cdr_indices_in_chain:
+            if local_idx < len(chain_token_indices):
+                global_idx = chain_token_indices[local_idx]
+                cdr_mask[global_idx] = True
+    
+    return cdr_mask
+
+
 class DataPipeline(object):
     """
     DataPipeline class provides static methods to handle various data processing tasks related to bioassembly structures.
@@ -243,7 +398,12 @@ class DataPipeline(object):
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
-    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
+        antibody_chain_ids: list[int] = None,
+        add_antigen: bool = True,
+        min_neighborhood: int = 0,
+        max_neighborhood: int = 40,
+        cdr_mask: np.ndarray = None,
+    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any], int, np.ndarray]:
         """
         Crop data based on the crop size and reference chain indices.
 
@@ -289,6 +449,7 @@ class DataPipeline(object):
                 msa_features or {},
                 template_features or {},
                 -1,
+                cdr_mask if cdr_mask is not None else np.zeros(len(bioassembly_dict["token_array"]), dtype=bool),
             )
 
         ref_chain_indices = DataPipeline._map_ref_chain(
@@ -305,6 +466,11 @@ class DataPipeline(object):
             spatial_crop_complete_lig=spatial_crop_complete_lig,
             drop_last=drop_last,
             remove_metal=remove_metal,
+            antibody_chain_ids=antibody_chain_ids,
+            add_antigen=add_antigen,
+            min_neighborhood=min_neighborhood,
+            max_neighborhood=max_neighborhood,
+            cdr_mask=cdr_mask,
         )
         # Get crop method
         crop_method = crop.random_crop_method()
@@ -338,10 +504,16 @@ class DataPipeline(object):
 
         if crop_method == "ContiguousCropping":
             resovled_atom_num = cropped_atom_array.is_resolved.sum()
-            # The criterion of “more than 4 atoms” is chosen arbitrarily.
+            # The criterion of "more than 4 atoms" is chosen arbitrarily.
             assert (
                 resovled_atom_num > 4
             ), f"{resovled_atom_num=} <= 4 after ContiguousCropping"
+
+        # Crop CDR mask
+        if cdr_mask is not None:
+            cropped_cdr_mask = cdr_mask[selected_indices]
+        else:
+            cropped_cdr_mask = np.zeros(len(cropped_token_array), dtype=bool)
 
         return (
             crop_method,
@@ -350,6 +522,7 @@ class DataPipeline(object):
             cropped_msa_features,
             cropped_template_features,
             reference_token_index,
+            cropped_cdr_mask,
         )
 
     @staticmethod

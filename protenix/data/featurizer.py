@@ -313,12 +313,19 @@ class Featurizer(object):
             token.frame_atom_index = frame_atom_index
         return token_array_w_frame
 
-    def get_token_features(self) -> dict[str, torch.Tensor]:
+    def get_token_features(
+        self, 
+        cdr_mask: np.ndarray = None
+    ) -> dict[str, torch.Tensor]:
         """
         Ref: AlphaFold3 SI Chapter 2.8
 
         Get token features.
         The size of these features is [N_token].
+
+        Args:
+            cdr_mask: Optional pre-computed CDR mask array of length N_token.
+                     If provided, this overrides cdr_chain_ids.
 
         Returns:
             Dict[str, torch.Tensor]: A dict of token features.
@@ -331,7 +338,21 @@ class Featurizer(object):
         centre_atoms = self.cropped_atom_array[centre_atoms_indices]
 
         restype = centre_atoms.cano_seq_resname
-        restype_onehot = self.restype_onehot_encoded(restype)
+
+        # Get CDR mask
+        if cdr_mask is not None:
+            is_cdr = np.array(cdr_mask, dtype=bool)
+        else:
+            raise ValueError("CDR mask must be provided")
+        
+        token_features["cdr_mask"] = torch.Tensor(is_cdr).bool()
+        masked_restype = ["UNK" if is_cdr[i] else restype[i] for i in range(len(restype))]
+        
+        token_id = torch.Tensor([STD_RESIDUES[r] if r in STD_RESIDUES else 31 for r in restype]).long()
+        token_features["token_gt"] = token_id
+        token_features["attn_mask"] = torch.ones(len(restype)).bool()
+        masked_restype_onehot = self.restype_onehot_encoded(masked_restype)
+        token_features["restype"] = masked_restype_onehot
 
         token_features["token_index"] = torch.arange(0, len(self.cropped_token_array))
         token_features["residue_index"] = torch.Tensor(
@@ -340,7 +361,7 @@ class Featurizer(object):
         token_features["asym_id"] = torch.Tensor(centre_atoms.asym_id_int).long()
         token_features["entity_id"] = torch.Tensor(centre_atoms.entity_id_int).long()
         token_features["sym_id"] = torch.Tensor(centre_atoms.sym_id_int).long()
-        token_features["restype"] = restype_onehot
+        # token_features["restype"] = restype_onehot
 
         return token_features
 
@@ -674,15 +695,23 @@ class Featurizer(object):
         ).long()  # [N_atom, N_atom]
         return mask_features
 
-    def get_all_input_features(self):
+    def get_all_input_features(
+        self, 
+        cdr_mask: np.ndarray = None
+    ):
         """
         Get input features from cropped data.
+
+        Args:
+            cdr_mask: Optional pre-computed CDR mask array.
 
         Returns:
             Dict[str, torch.Tensor]: a dict of features.
         """
         features = {}
-        token_features = self.get_token_features()
+        token_features = self.get_token_features(
+            cdr_mask=cdr_mask
+        )
         features.update(token_features)
 
         bond_features = self.get_bond_features()

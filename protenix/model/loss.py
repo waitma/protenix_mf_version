@@ -275,6 +275,51 @@ class SmoothLDDTLoss(nn.Module):
         return 1 - loss_reduction(lddt, method=self.reduction)
 
 
+class SequenceLoss(nn.Module):
+    """
+    Sequence prediction loss using CrossEntropyLoss
+    """
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super(SequenceLoss, self).__init__()
+        self.loss_fn = nn.CrossEntropyLoss(reduction="none")
+        self.reduction = reduction
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        target_seq: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """SequenceLoss
+
+        Args:
+            pred_logits (torch.Tensor): predicted sequence logits
+                [..., N_token, vocab_size]
+            target_seq (torch.Tensor): ground truth sequence indices
+                [..., N_token]
+            mask (torch.Tensor): valid token mask (e.g., cdr_mask or token_mask)
+                [..., N_token]
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: (loss, accuracy)
+        """
+        valid_mask = (target_seq >= 0) & (target_seq < pred_logits.shape[-1]) & mask.bool()
+        
+        if valid_mask.sum() == 0:
+            return 0.0 * pred_logits.sum(), torch.tensor(0.0, device=pred_logits.device)
+        
+        pred_filtered = pred_logits[valid_mask]
+        target_filtered = target_seq[valid_mask]
+        
+        loss = self.loss_fn(pred_filtered, target_filtered)
+        loss = loss_reduction(loss, method=self.reduction)
+        
+        acc = (pred_filtered.argmax(dim=-1) == target_filtered).float().mean()
+        
+        return loss, acc
+
+
 class BondLoss(nn.Module):
     """
     Implements Formula 5 [BondLoss] in AF3
@@ -1416,6 +1461,7 @@ class ProtenixLoss(nn.Module):
         self.alpha_distogram = self.configs.loss.weight.alpha_distogram
         self.alpha_bond = self.configs.loss.weight.alpha_bond
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
+        self.alpha_sequence = getattr(self.configs.loss.weight, 'alpha_sequence', 1.0)
 
         self.lddt_radius = {
             "is_nucleotide_threshold": 30.0,
@@ -1435,6 +1481,8 @@ class ProtenixLoss(nn.Module):
             * self.weight_smooth_lddt,  # Different from AF3 appendix eq(6), where smooth_lddt has no weight
             # distogram
             "distogram_loss": self.alpha_distogram,
+            # sequence
+            "sequence_loss": self.alpha_sequence,
         }
 
         # Loss
@@ -1446,6 +1494,8 @@ class ProtenixLoss(nn.Module):
         self.bond_loss = BondLoss(**configs.loss.diffusion.bond)
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
+        self.sequence_loss = SequenceLoss()
+        self.use_sequence = getattr(configs, 'use_sequence', False)
 
     def calculate_label(
         self,
@@ -1680,6 +1730,20 @@ class ProtenixLoss(nn.Module):
                         )
                     }
                 )
+            
+            # Sequence Loss
+            if self.use_sequence and "s_denoised" in pred_dict and pred_dict["s_denoised"] is not None:
+                seq_mask = feat_dict.get("token_mask", feat_dict.get("cdr_mask", None))
+                if seq_mask is not None:
+                    loss_fns.update(
+                        {
+                            "sequence_loss": lambda: self.sequence_loss(
+                                pred_logits=pred_dict["s_denoised"],
+                                target_seq=feat_dict["token_gt"],
+                                mask=seq_mask,
+                            )[0]
+                        }
+                    )
 
         # Confidence Loss:
         # Only when resoluton is in [min_resolution, max_resolution] the confidence loss is considered

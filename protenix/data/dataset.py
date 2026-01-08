@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 
 from protenix.data.constants import EvaluationChainInterface
 from protenix.data.constraint_featurizer import ConstraintFeatureGenerator
-from protenix.data.data_pipeline import DataPipeline
+from protenix.data.data_pipeline import DataPipeline, generate_cdr_mask
 from protenix.data.featurizer import Featurizer
 from protenix.data.msa_featurizer import MSAFeaturizer
 from protenix.data.tokenizer import TokenArray
@@ -112,6 +112,11 @@ class BaseSingleDataset(Dataset):
             self.constraint_generator = ConstraintFeatureGenerator(
                 self.constraint, self.ab_top2_clusters
             )
+        
+        # Configs for CDR (Complementarity Determining Region) annotation
+        self.cdr_config = kwargs.get("cdr_config", {})
+        if self.cdr_config.get("enable", False):
+            logger.info(f"[{self.name}] CDR config: {self.cdr_config}")
 
         self.error_dir = kwargs.get("error_dir", None)
         if self.error_dir is not None:
@@ -482,6 +487,17 @@ class BaseSingleDataset(Dataset):
 
         max_entity_mol_id = bioassembly_dict["atom_array"].entity_mol_id.max()
 
+        # Generate CDR mask before cropping
+        from protenix.data.data_pipeline import generate_cdr_mask
+        cdr_chain_ids = self.cdr_config.get("chain_ids", None) if self.cdr_config.get("enable", False) else None
+        full_cdr_mask = generate_cdr_mask(
+            token_array=bioassembly_dict["token_array"],
+            atom_array=bioassembly_dict["atom_array"],
+            cdr_chain_ids=cdr_chain_ids,
+            sequences=bioassembly_dict.get("sequences", None),
+            scheme=self.cdr_config.get("scheme", "imgt"),
+        )
+
         # Crop
         (
             crop_method,
@@ -490,9 +506,11 @@ class BaseSingleDataset(Dataset):
             cropped_msa_features,
             cropped_template_features,
             reference_token_index,
+            cropped_cdr_mask,
         ) = self.crop(
             sample_indice=sample_indice,
             bioassembly_dict=bioassembly_dict,
+            cdr_mask=full_cdr_mask,
             **self.cropping_configs,
         )
 
@@ -505,6 +523,7 @@ class BaseSingleDataset(Dataset):
             full_atom_array=bioassembly_dict["atom_array"],
             is_spatial_crop="spatial" in crop_method.lower(),
             max_entity_mol_id=max_entity_mol_id,
+            cdr_mask=cropped_cdr_mask,
         )
 
         # Basic info, e.g. dimension related items
@@ -562,11 +581,12 @@ class BaseSingleDataset(Dataset):
         bioassembly_dict: dict[str, Any],
         crop_size: int,
         method_weights: list[float],
+        cdr_mask: np.ndarray = None,
         contiguous_crop_complete_lig: bool = True,
         spatial_crop_complete_lig: bool = True,
         drop_last: bool = True,
         remove_metal: bool = True,
-    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
+    ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any], int, np.ndarray]:
         """
         Crops the bioassembly data based on the specified configurations.
 
@@ -574,6 +594,10 @@ class BaseSingleDataset(Dataset):
             A tuple containing the cropping method, cropped token array, cropped atom array,
                 cropped MSA features, and cropped template features.
         """
+        antibody_chain_ids = None
+        if self.cdr_config.get("enable", False):
+            antibody_chain_ids = self.cdr_config.get("chain_ids", None)
+        
         return DataPipeline.crop(
             one_sample=sample_indice,
             bioassembly_dict=bioassembly_dict,
@@ -585,6 +609,11 @@ class BaseSingleDataset(Dataset):
             spatial_crop_complete_lig=spatial_crop_complete_lig,
             drop_last=drop_last,
             remove_metal=remove_metal,
+            antibody_chain_ids=antibody_chain_ids,
+            add_antigen=self.cdr_config.get("add_antigen", True),
+            min_neighborhood=self.cdr_config.get("min_neighborhood", 0),
+            max_neighborhood=self.cdr_config.get("max_neighborhood", 40),
+            cdr_mask=cdr_mask,
         )
 
     def _get_sample_indice(self, idx: int) -> pd.Series:
@@ -710,6 +739,7 @@ class BaseSingleDataset(Dataset):
         full_atom_array: AtomArray,
         is_spatial_crop: bool = True,
         max_entity_mol_id: int = None,
+        cdr_mask: np.ndarray = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
         Get feature and label information for a given data point.
@@ -752,7 +782,9 @@ class BaseSingleDataset(Dataset):
             ref_pos_augment=self.ref_pos_augment,
             lig_atom_rename=self.lig_atom_rename,
         )
-        features_dict.update(feat.get_all_input_features())
+        
+        
+        features_dict.update(feat.get_all_input_features(cdr_mask=cdr_mask))
         labels_dict = feat.get_labels()
 
         # Permutation list for atom permutation

@@ -317,7 +317,18 @@ class SampleDictToFeatures:
         featurizer = Featurizer(
             token_array, atom_array, include_discont_poly_poly_bonds=True
         )
-        feature_dict = featurizer.get_all_input_features()
+        
+        # Get CDR mask from config if provided
+        from protenix.data.data_pipeline import generate_cdr_mask
+        cdr_config = self.input_dict.get("cdr_config", {})
+        cdr_chain_ids = cdr_config.get("chain_ids", None) if cdr_config.get("enable", False) else None
+        cdr_mask = generate_cdr_mask(
+            token_array=token_array,
+            atom_array=atom_array,
+            cdr_chain_ids=cdr_chain_ids,
+        )
+        
+        feature_dict = featurizer.get_all_input_features(cdr_mask=cdr_mask)
         feature_dict["constraint_feature"] = constraint_feature
 
         token_array_with_frame = featurizer.get_token_frame(

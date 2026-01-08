@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from protenix.model import sample_confidence
 from protenix.model.generator import (
+    TokenNoiser,
     InferenceNoiseScheduler,
     TrainingNoiseSampler,
     sample_diffusion,
@@ -98,6 +99,12 @@ class Protenix(nn.Module):
             assert configs.loss.weight.alpha_distogram == 0.0
 
         # Diffusion scheduler
+        self.use_sequence = self.configs.use_sequence
+        if self.use_sequence:
+            self.token_noiser = TokenNoiser(**configs.token_noiser)
+        else:
+            self.token_noiser = None
+
         self.train_noise_sampler = TrainingNoiseSampler(**configs.train_noise_sampler)
         self.inference_noise_scheduler = InferenceNoiseScheduler(
             **configs.inference_noise_scheduler
@@ -309,6 +316,9 @@ class Protenix(nn.Module):
                     if not self.training
                     else None
                 ),
+                "token_noiser": self.token_noiser,
+                "use_sequence": self.use_sequence,
+                "temperature": getattr(self.configs, 'temperature', 1.0),
             }
         )
         return autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
@@ -471,7 +481,7 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
-        pred_dict["coordinate"] = self.sample_diffusion(
+        diffusion_result = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
@@ -485,6 +495,11 @@ class Protenix(nn.Module):
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
         )
+        if self.use_sequence and isinstance(diffusion_result, tuple):
+            pred_dict["coordinate"] = diffusion_result[0]
+            pred_dict["seq_denoised"] = diffusion_result[1]
+        else:
+            pred_dict["coordinate"] = diffusion_result
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
@@ -707,6 +722,15 @@ class Protenix(nn.Module):
             # Skip diffusion loss and distogram loss. Return now.
             return pred_dict, label_dict, log_dict
 
+        # Here for seq, Discrete noise.
+        N_step = self.configs.sample_diffusion["N_step"]
+        inference_noise_schedule = self.inference_noise_scheduler(
+            N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
+        )
+        input_feature_dict["noise_schedule"] = inference_noise_schedule
+        input_feature_dict["gamma0"] = self.configs.sample_diffusion["gamma0"]
+        input_feature_dict["gamma_min"] = self.configs.sample_diffusion["gamma_min"]
+
         # Denoising: use permuted coords to generate noisy samples and perform denoising
         # x_denoised: [..., N_sample, N_atom, 3]
         # x_noise_level: [..., N_sample]
@@ -714,10 +738,11 @@ class Protenix(nn.Module):
         drop_conditioning = (
             random.random() < self.configs.model.condition_embedding_drop_rate
         )
-        _, x_denoised, x_noise_level = autocasting_disable_decorator(
+        _, x_denoised, x_noise_level, s_denoised = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
             noise_sampler=self.train_noise_sampler,
+            token_noiser=self.token_noiser,
             denoise_net=self.diffusion_module,
             label_dict=label_dict,
             input_feature_dict=input_feature_dict,
@@ -737,9 +762,9 @@ class Protenix(nn.Module):
                 "distogram": autocasting_disable_decorator(True)(self.distogram_head)(
                     z
                 ),
-                # [..., N_sample=48, N_atom, 3]: diffusion loss
                 "coordinate": x_denoised,
                 "noise_level": x_noise_level,
+                "s_denoised": s_denoised,
             }
         )
 

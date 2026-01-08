@@ -16,6 +16,8 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
+from torch.nn.functional import one_hot
+from protenix.data.constants import STD_RESIDUES
 
 from protenix.model.modules.embedders import FourierEmbedding, RelativePositionEncoding
 from protenix.model.modules.primitives import LinearNoBias, Transition
@@ -180,6 +182,59 @@ class DiffusionConditioning(nn.Module):
         return single_s, pair_z
 
 
+class TokenDenoiser(nn.Module):
+    def __init__(
+        self, 
+        hidden_dim, 
+        vocab_size,
+        dropout
+    ):
+        super().__init__()
+        # self.type_embed = nn.Embedding(4, hidden_dim, padding_idx=0) # 1: Heavy, 2: Light, 3: Ag
+        # self.region_embed = nn.Embedding(10, hidden_dim, padding_idx=0)
+        # self.proj = nn.Sequential(
+        #     nn.Linear(3 * hidden_dim, 2 * hidden_dim), nn.GELU(),
+        #     nn.Linear(2 * hidden_dim, hidden_dim), nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim)
+        # )
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )                   
+        self.dropout = nn.Dropout(dropout)
+        self.LayerNorm = nn.LayerNorm(hidden_dim, eps=1e-12)
+        self.encoder = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, vocab_size)
+        )
+                
+          
+    def forward(self, res_feat, cond=None):
+        """Denoise the sequence feature.
+
+        Args:
+            res_feat: The sequence feature. 
+            cond: The condition feature including type and region feature.
+
+        Returns:
+            res (batch_size, max_tokens, vocab_size): The denoised sequence one-hot code.
+        """
+        res = self.encoder(res_feat)
+        res = self.dropout(self.LayerNorm(self.proj(res)))
+        res = self.decoder(res)
+        return res
+
+
+
 class DiffusionSchedule:
     def __init__(
         self,
@@ -252,6 +307,8 @@ class DiffusionModule(nn.Module):
         drop_path_rate: float = 0.0,
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
+        use_sequence: Optional[bool] = False,
+        sequence_model_args: Optional[dict[str, int]] = None
     ) -> None:
         """
         Args:
@@ -322,6 +379,11 @@ class DiffusionModule(nn.Module):
             blocks_per_ckpt=blocks_per_ckpt,
         )
         self.normalize = LayerNorm(c_z, create_offset=False, create_scale=False)
+        self.use_sequence = use_sequence
+        if self.use_sequence:
+            if sequence_model_args is None:
+                raise ValueError("sequence model args must be provided when use sequence module.")
+            self.sequence_model = TokenDenoiser(**sequence_model_args)
 
     def f_forward(
         self,
@@ -372,6 +434,22 @@ class DiffusionModule(nn.Module):
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.
+
+        if self.use_sequence:
+            if "token_noisy" in input_feature_dict:
+                if len(input_feature_dict["token_noisy"].shape) == 2:
+                    new_restype = one_hot(input_feature_dict["token_noisy"], num_classes=len(STD_RESIDUES) + 1)
+                else:
+                    new_restype = input_feature_dict["token_noisy"]
+                if "attn_mask" in input_feature_dict:
+                    new_restype = new_restype * input_feature_dict["attn_mask"].unsqueeze(-1)
+                s_inputs = torch.cat([
+                    s_inputs[..., :self.c_token // 2],
+                    new_restype,
+                    s_inputs[..., self.c_token // 2 + len(STD_RESIDUES) + 1:],
+                ], dim=-1)
+      
+
         if blocks_per_ckpt:
             checkpoint_fn = get_checkpoint_fn()
             s_single, z_pair = checkpoint_fn(
@@ -472,6 +550,14 @@ class DiffusionModule(nn.Module):
 
         a_token = self.layernorm_a(a_token)
 
+        if self.use_sequence:
+            # cond = {}
+            # type and region embedding
+            s_denoised = self.sequence_model(a_token)
+        else:
+            s_denoised = None
+
+
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
@@ -497,7 +583,7 @@ class DiffusionModule(nn.Module):
                 chunk_size=chunk_size,
             )
 
-        return r_update
+        return r_update, s_denoised
 
     def forward(
         self,
@@ -549,7 +635,7 @@ class DiffusionModule(nn.Module):
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
         #     r_update = F(r_noisy, c_noise(sigma))
-        r_update = self.f_forward(
+        r_update, s_denoised = self.f_forward(
             r_noisy=r_noisy,
             t_hat_noise_level=t_hat_noise_level,
             input_feature_dict=input_feature_dict,
@@ -582,4 +668,4 @@ class DiffusionModule(nn.Module):
             + t_hat_noise_level[..., None, None] / torch.sqrt(1 + s_ratio**2) * r_update
         ).to(r_update.dtype)
 
-        return x_denoised
+        return x_denoised, s_denoised
