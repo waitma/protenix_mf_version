@@ -346,6 +346,7 @@ class Protenix(nn.Module):
         chunk_size: Optional[int] = 4,
         N_model_seed: int = 1,
         symmetric_permutation: SymmetricPermutation = None,
+        inpaint: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (multiple model seeds) for the Alphafold3 model.
@@ -359,6 +360,7 @@ class Protenix(nn.Module):
             chunk_size (Optional[int]): Chunk size for memory-efficient operations. Defaults to 4.
             N_model_seed (int): Number of model seeds. Defaults to 1.
             symmetric_permutation (SymmetricPermutation): Symmetric permutation object. Defaults to None.
+            inpaint (bool): Whether to use structure inpainting. Defaults to False.
 
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
@@ -375,6 +377,7 @@ class Protenix(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 symmetric_permutation=symmetric_permutation,
+                inpaint=inpaint,
             )
             pred_dicts.append(pred_dict)
             log_dicts.append(log_dict)
@@ -410,6 +413,7 @@ class Protenix(nn.Module):
         inplace_safe: bool = True,
         chunk_size: Optional[int] = 4,
         symmetric_permutation: SymmetricPermutation = None,
+        inpaint: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (single model seed) for the Alphafold3 model.
@@ -481,6 +485,14 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
+        inpaint_kwargs = {}
+        if inpaint and label_dict is not None:
+            inpaint_kwargs = {
+                "inpaint": True,
+                "coords_gt": label_dict.get("coordinate"),
+                "coords_mask": label_dict.get("coord_mask"),
+                "resolved_atom_mask": label_dict.get("coordinate_mask"),
+            }
         diffusion_result = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -494,6 +506,7 @@ class Protenix(nn.Module):
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
+            **inpaint_kwargs,
         )
         if self.use_sequence and isinstance(diffusion_result, tuple):
             pred_dict["coordinate"] = diffusion_result[0]
@@ -787,6 +800,7 @@ class Protenix(nn.Module):
         mode: str = "inference",
         current_step: Optional[int] = None,
         symmetric_permutation: SymmetricPermutation = None,
+        inpaint: Optional[bool] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -798,11 +812,14 @@ class Protenix(nn.Module):
             mode (str): Mode of operation ('train', 'inference', 'eval'). Defaults to 'inference'.
             current_step (Optional[int]): Current training step. Defaults to None.
             symmetric_permutation (SymmetricPermutation): Symmetric permutation object. Defaults to None.
+            inpaint (Optional[bool]): Whether to use structure inpainting. Defaults to None (use configs).
 
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
                 Prediction, updated label, and log dictionaries.
         """
+        if inpaint is None:
+            inpaint = getattr(self.configs, "use_inpaint", False)
 
         assert mode in ["train", "inference", "eval"]
         inplace_safe = not (self.training or torch.is_grad_enabled())
@@ -838,6 +855,7 @@ class Protenix(nn.Module):
                 chunk_size=chunk_size,
                 N_model_seed=self.N_model_seed,
                 symmetric_permutation=None,
+                inpaint=inpaint,
             )
             log_dict.update({"time": time_tracker})
         elif mode == "eval":
@@ -857,6 +875,7 @@ class Protenix(nn.Module):
                 chunk_size=chunk_size,
                 N_model_seed=self.N_model_seed,
                 symmetric_permutation=symmetric_permutation,
+                inpaint=inpaint,
             )
             log_dict.update({"time": time_tracker})
 

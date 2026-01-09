@@ -35,4 +35,5 @@ inference_configs = {
     "enable_tf32": True,
     "enable_efficient_fusion": True,
     "enable_diffusion_shared_vars_cache": True,
+    "use_inpaint": False,
 }

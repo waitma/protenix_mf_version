@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 
 from protenix.model.utils import centre_random_augmentation
+from protenix.metrics.rmsd import weighted_rigid_align
 import numpy as np
 import copy
 from torch.nn.functional import one_hot
@@ -207,6 +208,10 @@ def sample_diffusion(
     token_noiser: Optional["TokenNoiser"] = None,
     use_sequence: bool = False,
     temperature: float = 1.0,
+    inpaint: bool = False,
+    coords_gt: Optional[torch.Tensor] = None,
+    coords_mask: Optional[torch.Tensor] = None,
+    resolved_atom_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -231,6 +236,13 @@ def sample_diffusion(
         diffusion_chunk_size (Optional[int]): Chunk size for diffusion operation. Defaults to None.
         inplace_safe (bool): Whether to use inplace operations safely. Defaults to False.
         attn_chunk_size (Optional[int]): Chunk size for attention operation. Defaults to None.
+        inpaint (bool): Whether to use structure inpainting. Defaults to False.
+        coords_gt (Optional[torch.Tensor]): Ground truth coordinates for inpainting.
+            [..., N_atom, 3]
+        coords_mask (Optional[torch.Tensor]): Mask for atoms to design (True=design, False=keep GT).
+            [..., N_atom]
+        resolved_atom_mask (Optional[torch.Tensor]): Mask for resolved atoms used in alignment.
+            [..., N_atom]
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
@@ -311,6 +323,22 @@ def sample_diffusion(
                 enable_efficient_fusion=enable_efficient_fusion,
             )
 
+            if inpaint and coords_gt is not None:
+                atom_weight = torch.ones(x_denoised.shape[:-1], device=device, dtype=dtype)
+                if resolved_atom_mask is not None:
+                    atom_weight = atom_weight * resolved_atom_mask.float()
+                with torch.autocast("cuda", enabled=False):
+                    coords_gt_aligned = weighted_rigid_align(
+                        coords_gt.float().expand_as(x_denoised),
+                        x_denoised.float(),
+                        atom_weight.float(),
+                        stop_gradient=True,
+                    )
+                coords_gt_aligned = coords_gt_aligned.to(x_denoised.dtype)
+                x_denoised = torch.where(
+                    coords_mask[..., None].bool(), x_denoised, coords_gt_aligned
+                )
+
             if use_sequence and token_noiser is not None and s_denoised is not None:
                 t = N_step - 1 - step_idx
                 if t > 0:
@@ -340,6 +368,20 @@ def sample_diffusion(
             delta = (x_noisy - x_denoised) / t_hat[..., None, None]
             dt = c_tau - t_hat
             x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+
+        if inpaint and coords_gt is not None:
+            atom_weight = torch.ones(x_l.shape[:-1], device=device, dtype=dtype)
+            if resolved_atom_mask is not None:
+                atom_weight = atom_weight * resolved_atom_mask.float()
+            with torch.autocast("cuda", enabled=False):
+                coords_gt_aligned = weighted_rigid_align(
+                    coords_gt.float().expand_as(x_l),
+                    x_l.float(),
+                    atom_weight.float(),
+                    stop_gradient=True,
+                )
+            coords_gt_aligned = coords_gt_aligned.to(x_l.dtype)
+            x_l = torch.where(coords_mask[..., None].bool(), x_l, coords_gt_aligned)
 
         return x_l, seq_denoised_final
 
